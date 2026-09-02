@@ -384,6 +384,7 @@ async fn run_inner(mode: EppMode, policy_registry: WorkerSelectionPolicyRegistry
                 health_reporter,
                 draining,
                 shutdown,
+                ServeParams::from_env().await?,
             )
             .await
         } else {
@@ -407,6 +408,7 @@ async fn run_inner(mode: EppMode, policy_registry: WorkerSelectionPolicyRegistry
                 health_reporter,
                 draining,
                 shutdown,
+                ServeParams::from_env().await?,
             )
             .await
         }
@@ -414,6 +416,42 @@ async fn run_inner(mode: EppMode, policy_registry: WorkerSelectionPolicyRegistry
     .await;
     background_tasks.shutdown().await;
     result
+}
+
+/// Everything `serve` needs from the process environment, resolved once during
+/// startup.
+///
+/// Binding and env reads live here rather than inside `serve` so an unusable
+/// drain deadline surfaces in the startup log instead of being discovered on
+/// the shutdown path, and so the listener is bound at a single known point.
+struct ServeParams {
+    listener: TcpListener,
+    tls_acceptor: Option<TlsAcceptor>,
+    drain_deadline: std::time::Duration,
+}
+
+impl ServeParams {
+    async fn from_env() -> Result<Self> {
+        // Default to TLS. Verified working with kGateway (`appProtocol: http2`
+        // upstreams negotiate h2 over TLS via ALPN when the cert is presented).
+        // Set DYN_SECURE_SERVING=false to fall back to plaintext h2c, e.g. for
+        // local debugging or non-TLS gateways.
+        let secure_serving = parse_env("DYN_SECURE_SERVING", true);
+        let addr: std::net::SocketAddr = format!("0.0.0.0:{GRPC_PORT}").parse()?;
+        let tls_acceptor = if secure_serving {
+            Some(create_tls_acceptor()?)
+        } else {
+            None
+        };
+        Ok(Self {
+            listener: TcpListener::bind(addr).await?,
+            tls_acceptor,
+            drain_deadline: std::time::Duration::from_secs(parse_env(
+                GRACEFUL_SHUTDOWN_TIMEOUT_ENV,
+                DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+            )),
+        })
+    }
 }
 
 /// Await outstanding connection tasks, bounded by
@@ -424,20 +462,17 @@ async fn run_inner(mode: EppMode, policy_registry: WorkerSelectionPolicyRegistry
 /// the deadline expires are aborted; hyper 1.x exposes no protocol-level
 /// abrupt close, so that forced close is a TCP close rather than a second
 /// GOAWAY frame.
-async fn drain_connections(conns: &mut tokio::task::JoinSet<()>) {
+async fn drain_connections(conns: &mut tokio::task::JoinSet<()>, deadline: std::time::Duration) {
     if conns.is_empty() {
         return;
     }
-    let timeout_secs = parse_env(
-        GRACEFUL_SHUTDOWN_TIMEOUT_ENV,
-        DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
-    );
+    let timeout_secs = deadline.as_secs();
     tracing::info!(
         outstanding = conns.len(),
         timeout_secs,
         "Draining in-flight ext_proc connections"
     );
-    let drained = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+    let drained = tokio::time::timeout(deadline, async {
         while conns.join_next().await.is_some() {}
     })
     .await;
@@ -461,6 +496,7 @@ async fn serve<P: crate::EndpointPicker>(
     health_reporter: tonic_health::server::HealthReporter,
     draining: CancellationToken,
     shutdown: CancellationToken,
+    params: ServeParams,
 ) -> Result<()> {
     // Continuously mirror readiness onto the health status. `is_ready()` is a
     // *live* signal that can flip both ways — standalone discovery clears it when
@@ -520,26 +556,20 @@ async fn serve<P: crate::EndpointPicker>(
     };
 
     let server = ExtProcServer::new(picker);
-    // Default to TLS. Verified working with kGateway (`appProtocol: http2`
-    // upstreams negotiate h2 over TLS via ALPN when the cert is presented).
-    // Set DYN_SECURE_SERVING=false to fall back to plaintext h2c, e.g. for
-    // local debugging or non-TLS gateways.
-    let secure_serving = parse_env("DYN_SECURE_SERVING", true);
-    let addr: std::net::SocketAddr = format!("0.0.0.0:{GRPC_PORT}").parse()?;
-
-    let tls_acceptor = if secure_serving {
-        Some(create_tls_acceptor()?)
-    } else {
-        None
-    };
+    let ServeParams {
+        listener,
+        tls_acceptor,
+        drain_deadline,
+    } = params;
     {
         let svc = server.into_service();
-        let listener = TcpListener::bind(addr).await?;
+        let addr = listener.local_addr()?;
         let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
         tracing::info!(
             %addr,
             max_connections = MAX_CONCURRENT_CONNECTIONS,
-            transport = if secure_serving { "TLS" } else { "plaintext h2c" },
+            transport = if tls_acceptor.is_some() { "TLS" } else { "plaintext h2c" },
+            drain_deadline_secs = drain_deadline.as_secs(),
             "Listening for ext_proc connections"
         );
 
@@ -631,7 +661,7 @@ async fn serve<P: crate::EndpointPicker>(
         // Breaking the accept loop leaves the socket bound, so the kernel would
         // keep completing TCP handshakes for the whole drain window. Drop it.
         drop(listener);
-        drain_connections(&mut conns).await;
+        drain_connections(&mut conns, drain_deadline).await;
         readiness_task.abort();
         let _ = readiness_task.await;
         result
