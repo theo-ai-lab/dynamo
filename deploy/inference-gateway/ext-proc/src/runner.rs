@@ -33,6 +33,13 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 /// `DYN_EPP_GRACEFUL_SHUTDOWN_PROPAGATION_SECS`.
 const DEFAULT_GRACEFUL_SHUTDOWN_PROPAGATION_SECS: u64 = 5;
 const GRACEFUL_SHUTDOWN_PROPAGATION_ENV: &str = "DYN_EPP_GRACEFUL_SHUTDOWN_PROPAGATION_SECS";
+/// Bounded drain deadline for connections still open once accepts have
+/// stopped. The clock starts when the propagation window has elapsed and
+/// HTTP/2 graceful shutdown begins, not when the signal arrives; work still
+/// outstanding on expiry is force-closed. Configurable via
+/// `DYN_EPP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS`.
+const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 45;
+const GRACEFUL_SHUTDOWN_TIMEOUT_ENV: &str = "DYN_EPP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS";
 /// Max time to wait for the TLS handshake to complete before dropping the
 /// connection. Without this, a client that finishes the TCP connect but
 /// stalls the TLS handshake holds a connection-limit permit indefinitely;
@@ -240,9 +247,9 @@ async fn run_inner(mode: EppMode, policy_registry: WorkerSelectionPolicyRegistry
 
     // Shutdown coordination: on SIGTERM/SIGINT, flip health to NOT_SERVING
     // (the gateway stops routing new requests to this EPP), allow the endpoint
-    // propagation window to elapse, then stop accepting connections. The
-    // protocol-correct drain deadline and forced close of long-lived HTTP/2
-    // connections are handled by the follow-up connection-lifecycle work.
+    // propagation window to elapse, then stop accepting connections and begin
+    // HTTP/2 graceful shutdown so existing peers receive GOAWAY. Connections
+    // still open when the drain deadline expires are force-closed.
     let draining = CancellationToken::new();
     let shutdown = CancellationToken::new();
     let shutdown_task = {
@@ -335,6 +342,43 @@ async fn run_inner(mode: EppMode, policy_registry: WorkerSelectionPolicyRegistry
     result
 }
 
+/// Await outstanding connection tasks, bounded by
+/// `DYN_EPP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS`.
+///
+/// Callers must have signalled HTTP/2 graceful shutdown first, so peers have
+/// already been sent GOAWAY by the time this waits. Tasks still running when
+/// the deadline expires are aborted; hyper 1.x exposes no protocol-level
+/// abrupt close, so that forced close is a TCP close rather than a second
+/// GOAWAY frame.
+async fn drain_connections(conns: &mut tokio::task::JoinSet<()>) {
+    if conns.is_empty() {
+        return;
+    }
+    let timeout_secs = parse_env(
+        GRACEFUL_SHUTDOWN_TIMEOUT_ENV,
+        DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+    );
+    tracing::info!(
+        outstanding = conns.len(),
+        timeout_secs,
+        "Draining in-flight ext_proc connections"
+    );
+    let drained = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+        while conns.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            remaining = conns.len(),
+            timeout_secs,
+            "Drain deadline expired; force-closing remaining ext_proc connections"
+        );
+        conns.shutdown().await;
+    } else {
+        tracing::info!("All in-flight ext_proc connections drained");
+    }
+}
+
 /// Mirror the picker's live readiness onto the gRPC health status, then serve
 /// the ext_proc endpoint. Shared by both Dynamo-discovery and standalone modes.
 async fn serve<P: crate::EndpointPicker>(
@@ -420,6 +464,9 @@ async fn serve<P: crate::EndpointPicker>(
             "Listening for ext_proc connections (TLS)"
         );
 
+        // Track connection tasks so the drain can await them and, on deadline
+        // expiry, abort them. Detached tasks cannot be drained or force-closed.
+        let mut conns = tokio::task::JoinSet::new();
         let result: Result<()> = loop {
             // Acquire permit before accept() so we backpressure the listener
             // instead of accepting and immediately dropping connections. Stop
@@ -440,8 +487,9 @@ async fn serve<P: crate::EndpointPicker>(
             };
             let tls_acceptor = tls_acceptor.clone();
             let svc = svc.clone();
+            let conn_shutdown = shutdown.clone();
 
-            tokio::spawn(async move {
+            conns.spawn(async move {
                 let _permit = permit; // released when this task exits (incl. handshake timeout)
                 let tls_stream = match tokio::time::timeout(
                     TLS_HANDSHAKE_TIMEOUT,
@@ -466,16 +514,40 @@ async fn serve<P: crate::EndpointPicker>(
 
                 let io = hyper_util::rt::TokioIo::new(tls_stream);
                 let hyper_svc = hyper_util::service::TowerToHyperService::new(svc);
-                if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                // `serve_connection` borrows the builder, so the builder must
+                // outlive the connection future it returns.
+                let builder = hyper_util::server::conn::auto::Builder::new(
                     hyper_util::rt::TokioExecutor::new(),
-                )
-                .serve_connection(io, hyper_svc)
-                .await
-                {
-                    tracing::debug!(%remote_addr, error = %e, "Connection ended");
+                );
+                let conn = builder.serve_connection(io, hyper_svc);
+                tokio::pin!(conn);
+                // `graceful_shutdown` needs `Pin<&mut Connection>` and the
+                // connection must keep being polled afterwards for the GOAWAY
+                // to be written and in-flight streams to finish. `signalled`
+                // guards the select arm because `cancelled()` stays ready once
+                // fired, which would otherwise spin this task on a core for
+                // the whole drain window.
+                let mut signalled = false;
+                loop {
+                    tokio::select! {
+                        result = conn.as_mut() => {
+                            if let Err(e) = result {
+                                tracing::debug!(%remote_addr, error = %e, "Connection ended");
+                            }
+                            break;
+                        }
+                        _ = conn_shutdown.cancelled(), if !signalled => {
+                            signalled = true;
+                            conn.as_mut().graceful_shutdown();
+                        }
+                    }
                 }
             });
         };
+        // Breaking the accept loop leaves the socket bound, so the kernel would
+        // keep completing TCP handshakes for the whole drain window. Drop it.
+        drop(listener);
+        drain_connections(&mut conns).await;
         readiness_task.abort();
         let _ = readiness_task.await;
         result
