@@ -90,6 +90,80 @@ fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> T {
         .unwrap_or(default)
 }
 
+/// One accepted connection, TLS-terminated or plaintext.
+///
+/// Both transports run through the same accept loop and the same drain, so
+/// `DYN_SECURE_SERVING` selects how bytes are framed and nothing else. Without
+/// this, the plaintext path would need its own shutdown contract.
+enum ClientStream {
+    Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
+    Plain(tokio::net::TcpStream),
+}
+
+impl tokio::io::AsyncRead for ClientStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_read(cx, buf),
+            Self::Plain(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for ClientStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_write(cx, buf),
+            Self::Plain(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_flush(cx),
+            Self::Plain(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_shutdown(cx),
+            Self::Plain(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tls(stream) => std::pin::Pin::new(stream.as_mut()).poll_write_vectored(cx, bufs),
+            Self::Plain(stream) => std::pin::Pin::new(stream).poll_write_vectored(cx, bufs),
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            Self::Tls(stream) => stream.is_write_vectored(),
+            Self::Plain(stream) => stream.is_write_vectored(),
+        }
+    }
+}
+
 /// Generate a self-signed TLS acceptor for the ext-proc gRPC server.
 fn create_tls_acceptor() -> Result<TlsAcceptor> {
     use rcgen::{CertificateParams, KeyPair};
@@ -453,15 +527,20 @@ async fn serve<P: crate::EndpointPicker>(
     let secure_serving = parse_env("DYN_SECURE_SERVING", true);
     let addr: std::net::SocketAddr = format!("0.0.0.0:{GRPC_PORT}").parse()?;
 
-    if secure_serving {
-        let tls_acceptor = create_tls_acceptor()?;
+    let tls_acceptor = if secure_serving {
+        Some(create_tls_acceptor()?)
+    } else {
+        None
+    };
+    {
         let svc = server.into_service();
         let listener = TcpListener::bind(addr).await?;
         let conn_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
         tracing::info!(
             %addr,
             max_connections = MAX_CONCURRENT_CONNECTIONS,
-            "Listening for ext_proc connections (TLS)"
+            transport = if secure_serving { "TLS" } else { "plaintext h2c" },
+            "Listening for ext_proc connections"
         );
 
         // Track connection tasks so the drain can await them and, on deadline
@@ -491,28 +570,33 @@ async fn serve<P: crate::EndpointPicker>(
 
             conns.spawn(async move {
                 let _permit = permit; // released when this task exits (incl. handshake timeout)
-                let tls_stream = match tokio::time::timeout(
-                    TLS_HANDSHAKE_TIMEOUT,
-                    tls_acceptor.accept(tcp_stream),
-                )
-                .await
-                {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(e)) => {
-                        tracing::debug!(%remote_addr, error = %e, "TLS handshake failed");
-                        return;
+                let stream = match tls_acceptor {
+                    Some(tls_acceptor) => {
+                        match tokio::time::timeout(
+                            TLS_HANDSHAKE_TIMEOUT,
+                            tls_acceptor.accept(tcp_stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(s)) => ClientStream::Tls(Box::new(s)),
+                            Ok(Err(e)) => {
+                                tracing::debug!(%remote_addr, error = %e, "TLS handshake failed");
+                                return;
+                            }
+                            Err(_) => {
+                                tracing::debug!(
+                                    %remote_addr,
+                                    timeout_secs = TLS_HANDSHAKE_TIMEOUT.as_secs(),
+                                    "TLS handshake timed out; dropping connection"
+                                );
+                                return;
+                            }
+                        }
                     }
-                    Err(_) => {
-                        tracing::debug!(
-                            %remote_addr,
-                            timeout_secs = TLS_HANDSHAKE_TIMEOUT.as_secs(),
-                            "TLS handshake timed out; dropping connection"
-                        );
-                        return;
-                    }
+                    None => ClientStream::Plain(tcp_stream),
                 };
 
-                let io = hyper_util::rt::TokioIo::new(tls_stream);
+                let io = hyper_util::rt::TokioIo::new(stream);
                 let hyper_svc = hyper_util::service::TowerToHyperService::new(svc);
                 // `serve_connection` borrows the builder, so the builder must
                 // outlive the connection future it returns.
@@ -551,15 +635,6 @@ async fn serve<P: crate::EndpointPicker>(
         readiness_task.abort();
         let _ = readiness_task.await;
         result
-    } else {
-        tracing::info!(%addr, "Listening for ext_proc connections (plaintext h2)");
-        tonic::transport::Server::builder()
-            .add_service(server.into_service())
-            .serve_with_shutdown(addr, shutdown.cancelled_owned())
-            .await?;
-        readiness_task.abort();
-        let _ = readiness_task.await;
-        Ok(())
     }
 }
 
