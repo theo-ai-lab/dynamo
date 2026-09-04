@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use dynamo_kv_router::services::selection::WorkerSelectionPolicyRegistry;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -40,6 +40,8 @@ const GRACEFUL_SHUTDOWN_PROPAGATION_ENV: &str = "DYN_EPP_GRACEFUL_SHUTDOWN_PROPA
 /// `DYN_EPP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS`.
 const DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 45;
 const GRACEFUL_SHUTDOWN_TIMEOUT_ENV: &str = "DYN_EPP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS";
+const MIN_GRACEFUL_SHUTDOWN_SECS: u64 = 1;
+const MAX_GRACEFUL_SHUTDOWN_SECS: u64 = 300;
 /// Max time to wait for the TLS handshake to complete before dropping the
 /// connection. Without this, a client that finishes the TCP connect but
 /// stalls the TLS handshake holds a connection-limit permit indefinitely;
@@ -88,6 +90,71 @@ fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> T {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+fn parse_bounded_duration_secs(
+    key: &str,
+    value: Option<&str>,
+    default_secs: u64,
+    min_secs: u64,
+    max_secs: u64,
+) -> Result<std::time::Duration> {
+    let secs = match value {
+        Some(value) => value
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("{key} must be an integer number of seconds"))?,
+        None => default_secs,
+    };
+    if !(min_secs..=max_secs).contains(&secs) {
+        anyhow::bail!("{key} must be between {min_secs} and {max_secs} seconds; got {secs}")
+    }
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+fn duration_from_env(key: &str, default_secs: u64, min_secs: u64) -> Result<std::time::Duration> {
+    match std::env::var(key) {
+        Ok(value) => parse_bounded_duration_secs(
+            key,
+            Some(&value),
+            default_secs,
+            min_secs,
+            MAX_GRACEFUL_SHUTDOWN_SECS,
+        ),
+        Err(std::env::VarError::NotPresent) => parse_bounded_duration_secs(
+            key,
+            None,
+            default_secs,
+            min_secs,
+            MAX_GRACEFUL_SHUTDOWN_SECS,
+        ),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{key} must contain valid UTF-8")
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ShutdownTiming {
+    propagation_delay: std::time::Duration,
+    drain_deadline: std::time::Duration,
+}
+
+impl ShutdownTiming {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
+            propagation_delay: duration_from_env(
+                GRACEFUL_SHUTDOWN_PROPAGATION_ENV,
+                DEFAULT_GRACEFUL_SHUTDOWN_PROPAGATION_SECS,
+                0,
+            )?,
+            drain_deadline: duration_from_env(
+                GRACEFUL_SHUTDOWN_TIMEOUT_ENV,
+                DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+                MIN_GRACEFUL_SHUTDOWN_SECS,
+            )?,
+        })
+    }
 }
 
 /// One accepted connection, TLS-terminated or plaintext.
@@ -275,6 +342,7 @@ impl BackgroundTasks {
 
 async fn run_inner(mode: EppMode, policy_registry: WorkerSelectionPolicyRegistry) -> Result<()> {
     let standalone = matches!(mode, EppMode::Standalone);
+    let shutdown_timing = ShutdownTiming::from_env()?;
 
     let config = Config::from_env();
 
@@ -284,6 +352,8 @@ async fn run_inner(mode: EppMode, policy_registry: WorkerSelectionPolicyRegistry
         namespace = %config.namespace,
         component = %config.component,
         standalone,
+        propagation_secs = shutdown_timing.propagation_delay.as_secs(),
+        drain_deadline_secs = shutdown_timing.drain_deadline.as_secs(),
         "Starting Dynamo Rust EPP"
     );
 
@@ -329,6 +399,7 @@ async fn run_inner(mode: EppMode, policy_registry: WorkerSelectionPolicyRegistry
     let shutdown_task = {
         let draining = draining.clone();
         let shutdown = shutdown.clone();
+        let propagation_delay = shutdown_timing.propagation_delay;
         tokio::spawn(async move {
             wait_for_shutdown_signal().await;
             tracing::info!("Shutdown signal received; starting endpoint withdrawal");
@@ -337,15 +408,11 @@ async fn run_inner(mode: EppMode, policy_registry: WorkerSelectionPolicyRegistry
             // reached `serve` yet, health is already NOT_SERVING and the
             // draining cancellation below makes initialization return.
             draining.cancel();
-            let propagation_secs = parse_env(
-                GRACEFUL_SHUTDOWN_PROPAGATION_ENV,
-                DEFAULT_GRACEFUL_SHUTDOWN_PROPAGATION_SECS,
-            );
             tracing::info!(
-                propagation_secs,
+                propagation_secs = propagation_delay.as_secs(),
                 "EPP health set to NOT_SERVING; allowing endpoint propagation"
             );
-            tokio::time::sleep(std::time::Duration::from_secs(propagation_secs)).await;
+            tokio::time::sleep(propagation_delay).await;
             shutdown.cancel();
             tracing::info!("EPP endpoint propagation complete; stopping accepts");
         })
@@ -384,7 +451,7 @@ async fn run_inner(mode: EppMode, policy_registry: WorkerSelectionPolicyRegistry
                 health_reporter,
                 draining,
                 shutdown,
-                ServeParams::from_env().await?,
+                ServeParams::from_env(shutdown_timing.drain_deadline).await?,
             )
             .await
         } else {
@@ -408,7 +475,7 @@ async fn run_inner(mode: EppMode, policy_registry: WorkerSelectionPolicyRegistry
                 health_reporter,
                 draining,
                 shutdown,
-                ServeParams::from_env().await?,
+                ServeParams::from_env(shutdown_timing.drain_deadline).await?,
             )
             .await
         }
@@ -431,7 +498,7 @@ struct ServeParams {
 }
 
 impl ServeParams {
-    async fn from_env() -> Result<Self> {
+    async fn from_env(drain_deadline: std::time::Duration) -> Result<Self> {
         // Default to TLS. Verified working with kGateway (`appProtocol: http2`
         // upstreams negotiate h2 over TLS via ALPN when the cert is presented).
         // Set DYN_SECURE_SERVING=false to fall back to plaintext h2c, e.g. for
@@ -446,12 +513,22 @@ impl ServeParams {
         Ok(Self {
             listener: TcpListener::bind(addr).await?,
             tls_acceptor,
-            drain_deadline: std::time::Duration::from_secs(parse_env(
-                GRACEFUL_SHUTDOWN_TIMEOUT_ENV,
-                DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
-            )),
+            drain_deadline,
         })
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DrainOutcome {
+    Complete,
+    TimedOut,
+}
+
+fn reap_finished_connections(conns: &mut tokio::task::JoinSet<()>) -> Result<()> {
+    while let Some(result) = conns.try_join_next() {
+        result.context("ext_proc connection task failed")?;
+    }
+    Ok(())
 }
 
 /// Await outstanding connection tasks, bounded by
@@ -462,9 +539,12 @@ impl ServeParams {
 /// the deadline expires are aborted; hyper 1.x exposes no protocol-level
 /// abrupt close, so that forced close is a TCP close rather than a second
 /// GOAWAY frame.
-async fn drain_connections(conns: &mut tokio::task::JoinSet<()>, deadline: std::time::Duration) {
+async fn drain_connections(
+    conns: &mut tokio::task::JoinSet<()>,
+    deadline: std::time::Duration,
+) -> Result<DrainOutcome> {
     if conns.is_empty() {
-        return;
+        return Ok(DrainOutcome::Complete);
     }
     let timeout_secs = deadline.as_secs();
     tracing::info!(
@@ -473,18 +553,30 @@ async fn drain_connections(conns: &mut tokio::task::JoinSet<()>, deadline: std::
         "Draining in-flight ext_proc connections"
     );
     let drained = tokio::time::timeout(deadline, async {
-        while conns.join_next().await.is_some() {}
+        while let Some(result) = conns.join_next().await {
+            result.context("ext_proc connection task failed")?;
+        }
+        Ok::<(), anyhow::Error>(())
     })
     .await;
-    if drained.is_err() {
-        tracing::warn!(
-            remaining = conns.len(),
-            timeout_secs,
-            "Drain deadline expired; force-closing remaining ext_proc connections"
-        );
-        conns.shutdown().await;
-    } else {
-        tracing::info!("All in-flight ext_proc connections drained");
+    match drained {
+        Ok(Ok(())) => {
+            tracing::info!("All in-flight ext_proc connections drained");
+            Ok(DrainOutcome::Complete)
+        }
+        Ok(Err(error)) => {
+            conns.shutdown().await;
+            Err(error)
+        }
+        Err(_) => {
+            tracing::warn!(
+                remaining = conns.len(),
+                timeout_secs,
+                "Drain deadline expired; force-closing remaining ext_proc connections"
+            );
+            conns.shutdown().await;
+            Ok(DrainOutcome::TimedOut)
+        }
     }
 }
 
@@ -576,24 +668,58 @@ async fn serve<P: crate::EndpointPicker>(
         // Track connection tasks so the drain can await them and, on deadline
         // expiry, abort them. Detached tasks cannot be drained or force-closed.
         let mut conns = tokio::task::JoinSet::new();
-        let result: Result<()> = loop {
+        let result: Result<()> = 'serving: loop {
+            if let Err(error) = reap_finished_connections(&mut conns) {
+                break Err(error);
+            }
             // Acquire permit before accept() so we backpressure the listener
             // instead of accepting and immediately dropping connections. Stop
             // accepting once the endpoint propagation window has elapsed.
-            let permit = tokio::select! {
-                _ = shutdown.cancelled() => break Ok(()),
-                permit = conn_semaphore.clone().acquire_owned() => match permit {
-                    Ok(permit) => permit,
-                    Err(error) => break Err(error.into()),
-                },
+            let permit = loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break 'serving Ok(()),
+                    joined = conns.join_next(), if !conns.is_empty() => {
+                        if let Some(Err(error)) = joined {
+                            break 'serving Err(error).context("ext_proc connection task failed");
+                        }
+                    }
+                    permit = conn_semaphore.clone().acquire_owned() => match permit {
+                        Ok(permit) => break permit,
+                        Err(error) => break 'serving Err(error.into()),
+                    },
+                }
             };
-            let (tcp_stream, remote_addr) = tokio::select! {
-                _ = shutdown.cancelled() => break Ok(()),
-                accepted = listener.accept() => match accepted {
-                    Ok(accepted) => accepted,
-                    Err(error) => break Err(error.into()),
-                },
+            let (tcp_stream, remote_addr) = loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break 'serving Ok(()),
+                    joined = conns.join_next(), if !conns.is_empty() => {
+                        if let Some(Err(error)) = joined {
+                            break 'serving Err(error).context("ext_proc connection task failed");
+                        }
+                    }
+                    accepted = listener.accept() => match accepted {
+                        Ok(accepted) => break accepted,
+                        Err(error) => {
+                            tracing::error!(%error, "ext_proc listener accept failed; stopping server");
+                            break 'serving Err(error.into());
+                        }
+                    }
+                }
             };
+            // Cancellation can land after accept won its select. Close this
+            // just-accepted socket rather than admitting work into the drain.
+            if shutdown.is_cancelled() {
+                break Ok(());
+            }
+            if let Err(error) = tcp_stream.set_nodelay(true) {
+                tracing::warn!(
+                    %remote_addr,
+                    %error,
+                    "Failed to enable TCP_NODELAY for ext_proc connection"
+                );
+            }
             let tls_acceptor = tls_acceptor.clone();
             let svc = svc.clone();
             let conn_shutdown = shutdown.clone();
@@ -632,7 +758,8 @@ async fn serve<P: crate::EndpointPicker>(
                 // outlive the connection future it returns.
                 let builder = hyper_util::server::conn::auto::Builder::new(
                     hyper_util::rt::TokioExecutor::new(),
-                );
+                )
+                .http2_only();
                 let conn = builder.serve_connection(io, hyper_svc);
                 tokio::pin!(conn);
                 // `graceful_shutdown` needs `Pin<&mut Connection>` and the
@@ -658,28 +785,458 @@ async fn serve<P: crate::EndpointPicker>(
                 }
             });
         };
+        // Any serving-loop exit is a lifecycle exit, including accept,
+        // semaphore, and connection-task failures. Withdraw readiness and
+        // signal every connection before listener teardown and draining.
+        draining.cancel();
+        shutdown.cancel();
         // Breaking the accept loop leaves the socket bound, so the kernel would
         // keep completing TCP handshakes for the whole drain window. Drop it.
         drop(listener);
-        drain_connections(&mut conns, drain_deadline).await;
+        let drain_result = drain_connections(&mut conns, drain_deadline).await;
         readiness_task.abort();
         let _ = readiness_task.await;
-        result
+        result?;
+        drain_result?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::task::{Context as TaskContext, Poll};
+    use std::time::Duration;
 
     use dynamo_kv_router::WorkerSelectionPolicyFactory;
     use dynamo_kv_router::services::selection::WorkerSelectionPolicyProviderError;
-    use tokio::sync::Mutex;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::sync::{Mutex, mpsc};
+    use tokio_stream::wrappers::ReceiverStream;
+    use tonic::codegen::Service;
 
     use super::*;
     use crate::epp_standalone_config::{DYN_EPP_MODE, DYNAMO_RUNTIME_MODE};
+    use crate::picker::{PickError, PickResult};
+    use crate::proto::envoy::config::core::v3::{HeaderMap, HeaderValue};
+    use crate::proto::envoy::service::ext_proc::v3::{
+        HttpBody, HttpHeaders, ProcessingRequest,
+        external_processor_client::ExternalProcessorClient, processing_request::Request as ProcReq,
+    };
+    use crate::{Endpoint, EndpointPicker, RequestInfo};
 
     static EPP_MODE_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+
+    #[derive(Clone, Copy, Debug)]
+    enum TestTransport {
+        Tls,
+        H2c,
+    }
+
+    trait TestAsyncIo: AsyncRead + AsyncWrite + Unpin {}
+    impl<T: AsyncRead + AsyncWrite + Unpin> TestAsyncIo for T {}
+
+    struct TestIo(Box<dyn TestAsyncIo + Send>);
+
+    impl AsyncRead for TestIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(self.get_mut().0.as_mut()).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for TestIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(self.get_mut().0.as_mut()).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(self.get_mut().0.as_mut()).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(self.get_mut().0.as_mut()).poll_shutdown(cx)
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            bufs: &[std::io::IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(self.get_mut().0.as_mut()).poll_write_vectored(cx, bufs)
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.0.is_write_vectored()
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestConnector {
+        addr: std::net::SocketAddr,
+        transport: TestTransport,
+    }
+
+    impl Service<tonic::codegen::http::Uri> for TestConnector {
+        type Response = hyper_util::rt::TokioIo<TestIo>;
+        type Error = std::io::Error;
+        type Future =
+            Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _uri: tonic::codegen::http::Uri) -> Self::Future {
+            let addr = self.addr;
+            let transport = self.transport;
+            Box::pin(async move {
+                let tcp = tokio::net::TcpStream::connect(addr).await?;
+                let io: Box<dyn TestAsyncIo + Send> = match transport {
+                    TestTransport::H2c => Box::new(tcp),
+                    TestTransport::Tls => {
+                        let mut config =
+                            dynamo_runtime::tls_utils::client_tls_config(None, true, None, None)
+                                .map_err(std::io::Error::other)?;
+                        config.alpn_protocols = vec![b"h2".to_vec()];
+                        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+                        let server_name = rustls::pki_types::ServerName::try_from("localhost")
+                            .map_err(std::io::Error::other)?
+                            .to_owned();
+                        Box::new(connector.connect(server_name, tcp).await?)
+                    }
+                };
+                Ok(hyper_util::rt::TokioIo::new(TestIo(io)))
+            })
+        }
+    }
+
+    struct TestPicker;
+
+    #[tonic::async_trait]
+    impl EndpointPicker for TestPicker {
+        async fn pick(
+            &self,
+            _req: &RequestInfo,
+            _endpoints: &[Endpoint],
+        ) -> std::result::Result<PickResult, PickError> {
+            Ok(PickResult {
+                endpoint: "127.0.0.1:8000".to_string(),
+                ..Default::default()
+            })
+        }
+    }
+
+    fn request_headers() -> ProcessingRequest {
+        ProcessingRequest {
+            request: Some(ProcReq::RequestHeaders(HttpHeaders {
+                headers: Some(HeaderMap {
+                    headers: vec![HeaderValue {
+                        key: "x-request-id".to_string(),
+                        value: "drain-test".to_string(),
+                        raw_value: vec![],
+                    }],
+                }),
+                end_of_stream: true,
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn response_headers() -> ProcessingRequest {
+        ProcessingRequest {
+            request: Some(ProcReq::ResponseHeaders(HttpHeaders {
+                headers: Some(HeaderMap { headers: vec![] }),
+                end_of_stream: false,
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn response_body() -> ProcessingRequest {
+        ProcessingRequest {
+            request: Some(ProcReq::ResponseBody(HttpBody {
+                body: b"{}".to_vec(),
+                end_of_stream: true,
+            })),
+            ..Default::default()
+        }
+    }
+
+    struct TestServer {
+        addr: std::net::SocketAddr,
+        client: ExternalProcessorClient<tonic::transport::Channel>,
+        draining: CancellationToken,
+        shutdown: CancellationToken,
+        task: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    async fn start_server(transport: TestTransport, drain_deadline: Duration) -> TestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tls_acceptor = match transport {
+            TestTransport::Tls => Some(create_tls_acceptor().unwrap()),
+            TestTransport::H2c => None,
+        };
+        let draining = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        let (health_reporter, _health_service) = tonic_health::server::health_reporter();
+        let task = tokio::spawn(serve(
+            Arc::new(TestPicker),
+            || true,
+            health_reporter,
+            draining.clone(),
+            shutdown.clone(),
+            ServeParams {
+                listener,
+                tls_acceptor,
+                drain_deadline,
+            },
+        ));
+        let channel = tonic::transport::Endpoint::from_static("http://drain.test")
+            .connect_timeout(Duration::from_secs(1))
+            .timeout(Duration::from_secs(1))
+            .connect_with_connector(TestConnector { addr, transport })
+            .await
+            .unwrap();
+        let mut client = ExternalProcessorClient::new(channel);
+        run_complete_exchange(&mut client).await;
+        TestServer {
+            addr,
+            client,
+            draining,
+            shutdown,
+            task,
+        }
+    }
+
+    async fn open_exchange(
+        client: &mut ExternalProcessorClient<tonic::transport::Channel>,
+    ) -> (
+        mpsc::Sender<ProcessingRequest>,
+        tonic::Streaming<crate::proto::envoy::service::ext_proc::v3::ProcessingResponse>,
+    ) {
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(request_headers()).await.unwrap();
+        let mut response = client
+            .process(ReceiverStream::new(rx))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = tokio::time::timeout(Duration::from_secs(1), response.message())
+            .await
+            .expect("server should answer the initial request headers")
+            .unwrap();
+        assert!(first.is_some());
+        (tx, response)
+    }
+
+    async fn finish_exchange(
+        tx: mpsc::Sender<ProcessingRequest>,
+        mut response: tonic::Streaming<
+            crate::proto::envoy::service::ext_proc::v3::ProcessingResponse,
+        >,
+    ) {
+        tx.send(response_headers()).await.unwrap();
+        tx.send(response_body()).await.unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while response.message().await.unwrap().is_some() {}
+        })
+        .await
+        .expect("existing stream should finish during graceful drain");
+    }
+
+    async fn run_complete_exchange(
+        client: &mut ExternalProcessorClient<tonic::transport::Channel>,
+    ) {
+        let (tx, response) = open_exchange(client).await;
+        finish_exchange(tx, response).await;
+    }
+
+    async fn wait_for_listener_close(addr: std::net::SocketAddr) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+                drop(stream);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("listener should close when draining starts");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_rejects_new_streams_but_finishes_existing_streams() {
+        for transport in [TestTransport::Tls, TestTransport::H2c] {
+            let TestServer {
+                addr,
+                mut client,
+                draining,
+                shutdown,
+                task,
+            } = start_server(transport, Duration::from_secs(1)).await;
+            let (tx, response) = open_exchange(&mut client).await;
+
+            shutdown.cancel();
+            wait_for_listener_close(addr).await;
+
+            let new_stream = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.process(tokio_stream::iter([request_headers()])),
+            )
+            .await
+            .expect("a post-GOAWAY stream should be rejected promptly");
+            assert!(
+                new_stream.is_err(),
+                "{transport:?} accepted a new stream after graceful shutdown"
+            );
+
+            finish_exchange(tx, response).await;
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("server should exit after the existing stream finishes")
+                .expect("serve task should not panic")
+                .expect("graceful serve should succeed");
+            assert!(draining.is_cancelled());
+            assert!(shutdown.is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_force_closes_stuck_streams_at_the_deadline() {
+        for transport in [TestTransport::Tls, TestTransport::H2c] {
+            let TestServer {
+                mut client,
+                draining,
+                shutdown,
+                task,
+                ..
+            } = start_server(transport, Duration::from_millis(40)).await;
+            let (tx, mut response) = open_exchange(&mut client).await;
+
+            shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("drain deadline should bound server exit")
+                .expect("serve task should not panic")
+                .expect("forced-close drain should succeed");
+
+            tokio::time::timeout(Duration::from_secs(1), tx.closed())
+                .await
+                .expect("force-closing the transport should close the request stream");
+            let terminal = tokio::time::timeout(Duration::from_secs(1), response.message())
+                .await
+                .expect("force-closing the transport should end the response stream");
+            assert!(
+                terminal.is_err() || terminal.unwrap().is_none(),
+                "{transport:?} produced another response after forced close"
+            );
+            assert!(draining.is_cancelled());
+            assert!(shutdown.is_cancelled());
+        }
+    }
+
+    #[test]
+    fn graceful_timing_rejects_malformed_and_out_of_range_values() {
+        assert!(
+            parse_bounded_duration_secs("TEST_TIMEOUT", Some("not-a-number"), 45, 1, 300).is_err()
+        );
+        assert!(parse_bounded_duration_secs("TEST_TIMEOUT", Some("0"), 45, 1, 300).is_err());
+        assert!(parse_bounded_duration_secs("TEST_TIMEOUT", Some("301"), 45, 1, 300).is_err());
+    }
+
+    #[test]
+    fn graceful_timing_uses_default_and_accepts_bounds() {
+        assert_eq!(
+            parse_bounded_duration_secs("TEST_TIMEOUT", None, 45, 1, 300).unwrap(),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            parse_bounded_duration_secs("TEST_TIMEOUT", Some("1"), 45, 1, 300).unwrap(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            parse_bounded_duration_secs("TEST_TIMEOUT", Some("300"), 45, 1, 300).unwrap(),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_connection_tasks_are_reaped_during_serving() {
+        let mut conns = tokio::task::JoinSet::new();
+        for _ in 0..256 {
+            conns.spawn(async {});
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !conns.is_empty() {
+                reap_finished_connections(&mut conns).unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed connection tasks should be reaped promptly");
+    }
+
+    #[tokio::test]
+    async fn reaping_surfaces_connection_task_panics() {
+        let mut conns = tokio::task::JoinSet::new();
+        conns.spawn(async { panic!("connection task panic") });
+
+        let error = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match reap_finished_connections(&mut conns) {
+                    Ok(()) => tokio::task::yield_now().await,
+                    Err(error) => break error,
+                }
+            }
+        })
+        .await
+        .expect("panicked connection task should become observable");
+        assert!(error.to_string().contains("connection task failed"));
+    }
+
+    #[tokio::test]
+    async fn drain_allows_completed_connections_to_finish() {
+        let mut conns = tokio::task::JoinSet::new();
+        conns.spawn(async { tokio::time::sleep(Duration::from_millis(10)).await });
+
+        let outcome = drain_connections(&mut conns, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, DrainOutcome::Complete);
+        assert!(conns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_force_closes_a_stuck_connection_at_the_deadline() {
+        let mut conns = tokio::task::JoinSet::new();
+        conns.spawn(async { std::future::pending::<()>().await });
+
+        let outcome = drain_connections(&mut conns, Duration::from_millis(20))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, DrainOutcome::TimedOut);
+        assert!(conns.is_empty());
+    }
 
     #[tokio::test]
     async fn linked_policy_registry_requires_standalone_mode() {

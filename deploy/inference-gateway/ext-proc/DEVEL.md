@@ -136,7 +136,13 @@ The common local environment variables are:
 | `DYN_COMPONENT_NAME` | `backend` | Dynamo component that exposes the `generate` endpoint. |
 | `DYN_ENFORCE_DISAGG` | `false` | Deprecated and ignored. Registered worker types determine routing topology and readiness. |
 | `DYN_KUBE_DISCOVERY_MODE` | `pod` | Kubernetes discovery identity mode. The EPP currently rejects `container`. |
+| `DYN_EPP_GRACEFUL_SHUTDOWN_PROPAGATION_SECS` | `5` | Time for the gateway to observe NOT_SERVING before the EPP stops accepting connections (0-300 seconds). |
+| `DYN_EPP_GRACEFUL_SHUTDOWN_TIMEOUT_SECS` | `45` | Deadline for existing HTTP/2 streams after GOAWAY; remaining connections are force-closed (1-300 seconds). |
 | `RUST_LOG` | `info` | Tracing log filter. |
+
+Set the pod's `terminationGracePeriodSeconds` longer than the propagation delay plus the drain
+deadline and an operational safety margin. The on-ramp manifest uses 60 seconds for the default
+5-second propagation and 45-second drain budget.
 
 ## Cleaning
 

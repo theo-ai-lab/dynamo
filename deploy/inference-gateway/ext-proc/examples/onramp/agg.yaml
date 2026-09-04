@@ -241,6 +241,9 @@ spec:
       labels:
         app: dynamo-epp
     spec:
+      # Must exceed endpoint propagation (5s) + connection drain (45s),
+      # leaving time for process teardown before the kubelet sends SIGKILL.
+      terminationGracePeriodSeconds: 60
       serviceAccountName: dynamo-epp
       containers:
         - name: epp
